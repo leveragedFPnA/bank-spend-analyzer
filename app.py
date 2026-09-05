@@ -593,7 +593,7 @@ with st.sidebar:
                 st.rerun()
 
             except Exception as error:
-                st.error(f"Import failed: {error}")
+                st.exception(error)
 
 data = st.session_state.data
 
