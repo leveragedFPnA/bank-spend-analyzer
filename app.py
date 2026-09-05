@@ -184,8 +184,9 @@ def classify(description, transaction_type):
 
 def read_delimited_file(uploaded_file):
     raw_bytes = uploaded_file.getvalue()
-    encodings = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+    encodings = ["utf-8-sig", "utf-8", "utf-16", "cp1252", "latin-1"]
     delimiters = [",", "\t", ";", "|"]
+    fallback = None
 
     for encoding in encodings:
         try:
@@ -193,25 +194,61 @@ def read_delimited_file(uploaded_file):
         except UnicodeDecodeError:
             continue
 
-        for delimiter in delimiters:
-            try:
-                dataframe = pd.read_csv(
-                    io.StringIO(text),
-                    sep=delimiter,
-                    dtype=str,
-                    engine="python",
-                ).dropna(how="all")
+        if not text.strip():
+            continue
 
-                if not dataframe.empty and len(dataframe.columns) > 1:
-                    return dataframe
+        lines = text.splitlines()
+        max_skip = min(40, max(1, len(lines) - 1))
 
-            except Exception:
-                continue
+        for skip_rows in range(max_skip):
+            for delimiter in delimiters:
+                try:
+                    dataframe = pd.read_csv(
+                        io.StringIO(text),
+                        sep=delimiter,
+                        skiprows=skip_rows,
+                        dtype=str,
+                        engine="python",
+                        on_bad_lines="skip",
+                    ).dropna(how="all")
+
+                    if dataframe.empty or len(dataframe.columns) < 2:
+                        continue
+
+                    headers = " ".join(
+                        clean(column) for column in dataframe.columns
+                    )
+
+                    expected_headers = [
+                        "date",
+                        "description",
+                        "amount",
+                        "debit",
+                        "credit",
+                        "merchant",
+                        "memo",
+                        "transaction",
+                    ]
+
+                    if any(
+                        header in headers
+                        for header in expected_headers
+                    ):
+                        return dataframe
+
+                    if fallback is None:
+                        fallback = dataframe
+
+                except Exception:
+                    continue
+
+    if fallback is not None:
+        return fallback
 
     raise ValueError(
-        "Could not read this file. Export it again as CSV or Excel."
+        "The file could not be read. Please export it from your bank "
+        "as CSV or Excel format."
     )
-
 
 def standardize(dataframe, source_file):
     data = dataframe.dropna(how="all").copy()
