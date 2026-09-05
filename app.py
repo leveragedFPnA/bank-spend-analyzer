@@ -1,5 +1,6 @@
-import io
 import re
+import smtplib
+from email.mime.text import MIMEText
 
 import pandas as pd
 import streamlit as st
@@ -99,10 +100,7 @@ MERCHANT_PROFILES = [
     {
         "merchant": "DMart",
         "category": "Groceries",
-        "aliases": [
-            "dmart",
-            "avenue supermarts",
-        ],
+        "aliases": ["dmart", "avenue supermarts"],
     },
 ]
 
@@ -164,14 +162,6 @@ CATEGORY_SIGNALS = {
         "membership": 5,
         "premium": 4,
     },
-    "Education": {
-        "school": 6,
-        "college": 6,
-        "university": 6,
-        "course": 5,
-        "tuition": 6,
-        "education": 5,
-    },
 }
 
 
@@ -209,28 +199,13 @@ def matches_alias(text, alias):
     normalized_text = normalize_text(text)
     normalized_alias = normalize_text(alias)
 
-    if not normalized_alias:
-        return False
-
-    exact_pattern = (
-        rf"(?<![a-z0-9]){re.escape(normalized_alias)}"
-        rf"(?![a-z0-9])"
-    )
-
-    if re.search(exact_pattern, normalized_text):
+    if normalized_alias in normalized_text:
         return True
 
     compact_alias = compact_text(normalized_alias)
     compact_description = compact_text(normalized_text)
 
-    return (
-        len(compact_alias) >= 6
-        and compact_alias in compact_description
-    )
-
-
-def contains_any(text, terms):
-    return any(matches_alias(text, term) for term in terms)
+    return len(compact_alias) >= 5 and compact_alias in compact_description
 
 
 def identify_known_merchant(narration):
@@ -248,42 +223,36 @@ def extract_unknown_merchant(narration):
     text = normalize_text(narration)
 
     for noise in PROCESSING_NOISE:
-        text = re.sub(
-            rf"(?<![a-z0-9]){re.escape(noise)}(?![a-z0-9])",
-            " ",
-            text,
-        )
+        text = text.replace(noise, " ")
 
     words = [
         word
         for word in text.split()
-        if not any(char.isdigit() for char in word)
-        and len(word) > 1
+        if len(word) > 1
+        and not any(character.isdigit() for character in word)
+        and word not in {"com", "in"}
     ]
 
-    if not words:
-        return "Unknown"
-
-    return " ".join(words[:4]).title()
+    return " ".join(words[:4]).title() or "Unknown"
 
 
-def infer_category_from_description(narration):
+def infer_category(narration):
     text = normalize_text(narration)
     scores = {}
-    matched_signals = {}
+    matched = {}
 
     for category_name, signals in CATEGORY_SIGNALS.items():
-        category_score = 0
-        category_matches = []
+        score = 0
+        terms = []
 
         for signal, weight in signals.items():
             if matches_alias(text, signal):
-                category_score += weight
-                category_matches.append(signal)
+                score += weight
+                terms.append(signal)
 
-        if category_score:
-            scores[category_name] = category_score
-            matched_signals[category_name] = category_matches
+        if score:
+            scores[category_name] = score
+            matched[category_name] = terms
 
     if not scores:
         return (
@@ -293,59 +262,44 @@ def infer_category_from_description(narration):
         )
 
     best_category = max(scores, key=scores.get)
-    best_score = scores[best_category]
-    matched = ", ".join(matched_signals[best_category][:3])
-
-    confidence = "High" if best_score >= 6 else "Medium"
+    confidence = "High" if scores[best_category] >= 6 else "Medium"
+    terms = ", ".join(matched[best_category][:3])
 
     return (
         best_category,
         confidence,
-        f"Description matched: {matched}",
+        f"Matched: {terms}",
     )
 
 
 def classify_transaction(row):
-    narration = str(row.get("Narration", ""))
-    withdrawal = float(row.get("Withdrawal", 0) or 0)
-    deposit = float(row.get("Deposit", 0) or 0)
+    narration = str(row["Narration"])
+    withdrawal = float(row["Withdrawal"])
+    deposit = float(row["Deposit"])
 
-    known_merchant = identify_known_merchant(narration)
+    profile = identify_known_merchant(narration)
 
-    if known_merchant:
+    if profile:
         return (
-            known_merchant["merchant"],
-            known_merchant["category"],
+            profile["merchant"],
+            profile["category"],
             "High",
-            f"Recognized merchant: "
-            f"{known_merchant['merchant']}",
+            f"Recognized merchant: {profile['merchant']}",
         )
 
     if deposit > 0 and withdrawal == 0:
-        merchant = extract_unknown_merchant(narration)
-
         return (
-            merchant,
+            extract_unknown_merchant(narration),
             "Income",
             "Medium",
             "Deposit transaction",
         )
 
-    if withdrawal <= 0:
-        return (
-            extract_unknown_merchant(narration),
-            "Other",
-            "Low",
-            "No spending amount identified",
-        )
-
-    inferred_category, confidence, reason = (
-        infer_category_from_description(narration)
-    )
+    category, confidence, reason = infer_category(narration)
 
     return (
         extract_unknown_merchant(narration),
-        inferred_category,
+        category,
         confidence,
         reason,
     )
@@ -357,30 +311,20 @@ def classify_transactions(data):
         axis=1,
         result_type="expand",
     )
-
     classified.columns = [
         "Merchant",
         "Category",
         "Confidence",
         "Classification Reason",
     ]
-
     return pd.concat(
-        [
-            data.reset_index(drop=True),
-            classified.reset_index(drop=True),
-        ],
+        [data.reset_index(drop=True), classified],
         axis=1,
     )
 
 
 def parse_amount(value):
-    text = str(value).strip()
-
-    if not text or text in {"-", "—"}:
-        return 0.0
-
-    cleaned = re.sub(r"[^0-9.]", "", text)
+    cleaned = re.sub(r"[^0-9.]", "", str(value))
 
     if not cleaned:
         return 0.0
@@ -392,11 +336,10 @@ def parse_amount(value):
 
 
 def find_position(header, labels):
-    header_lower = header.lower()
+    header = header.lower()
 
     for label in labels:
-        position = header_lower.find(label.lower())
-
+        position = header.find(label.lower())
         if position >= 0:
             return position
 
@@ -404,24 +347,13 @@ def find_position(header, labels):
 
 
 def get_field(line, start, end=None):
-    padded_line = line.ljust(180)
-
-    if end is None:
-        return padded_line[start:].strip()
-
-    return padded_line[start:end].strip()
+    line = line.ljust(180)
+    return line[start:end].strip() if end else line[start:].strip()
 
 
 def parse_txt(content):
-    text = content.decode(
-        "utf-8-sig",
-        errors="replace",
-    )
-
-    lines = [
-        line.expandtabs(8)
-        for line in text.splitlines()
-    ]
+    text = content.decode("utf-8-sig", errors="replace")
+    lines = [line.expandtabs(8) for line in text.splitlines()]
 
     header_index = next(
         (
@@ -435,22 +367,15 @@ def parse_txt(content):
     )
 
     if header_index is None:
-        raise ValueError(
-            "Could not find the bank statement header."
-        )
+        raise ValueError("Statement header was not found.")
 
     header = lines[header_index]
-
     positions = {
         "date": find_position(header, ["date"]),
         "narration": find_position(header, ["narration"]),
         "reference": find_position(
             header,
-            [
-                "chq./ref.no.",
-                "chq./ref",
-                "ref.no.",
-            ],
+            ["chq./ref.no.", "chq./ref", "ref.no."],
         ),
         "value_date": find_position(
             header,
@@ -458,56 +383,33 @@ def parse_txt(content):
         ),
         "withdrawal": find_position(
             header,
-            [
-                "withdrawal amt.",
-                "withdrawal",
-            ],
+            ["withdrawal amt.", "withdrawal"],
         ),
         "deposit": find_position(
             header,
-            [
-                "deposit amt.",
-                "deposit",
-            ],
+            ["deposit amt.", "deposit"],
         ),
         "balance": find_position(
             header,
-            [
-                "closing balance",
-                "balance",
-            ],
+            ["closing balance", "balance"],
         ),
     }
 
-    missing = [
-        name
-        for name, position in positions.items()
-        if position < 0
-    ]
+    if any(value < 0 for value in positions.values()):
+        raise ValueError("One or more statement columns are missing.")
 
-    if missing:
-        raise ValueError(
-            "Missing columns: " + ", ".join(missing)
-        )
-
-    transaction_start = re.compile(
-        r"^\s*\d{2}/\d{2}/\d{2,4}\b"
-    )
-
+    transaction_start = re.compile(r"^\s*\d{2}/\d{2}/\d{2,4}\b")
     rows = []
     current = None
 
     for line in lines[header_index + 1:]:
         stripped = line.strip()
 
-        if not stripped:
-            continue
-
-        if set(stripped) <= {"-", " "}:
+        if not stripped or set(stripped) <= {"-", " "}:
             continue
 
         if transaction_start.match(line):
-            if current is not None:
+            if current:
                 rows.append(current)
 
             current = {
@@ -521,16 +423,6 @@ def parse_txt(content):
                     positions["narration"],
                     positions["reference"],
                 ),
-                "Reference": get_field(
-                    line,
-                    positions["reference"],
-                    positions["value_date"],
-                ),
-                "Value Date": get_field(
-                    line,
-                    positions["value_date"],
-                    positions["withdrawal"],
-                ),
                 "Withdrawal": get_field(
                     line,
                     positions["withdrawal"],
@@ -541,318 +433,215 @@ def parse_txt(content):
                     positions["deposit"],
                     positions["balance"],
                 ),
-                "Balance": get_field(
-                    line,
-                    positions["balance"],
-                ),
+                "Balance": get_field(line, positions["balance"]),
             }
-        elif current is not None:
-            current["Narration"] = (
-                current["Narration"] + " " + stripped
-            ).strip()
+        elif current:
+            current["Narration"] += " " + stripped
 
-    if current is not None:
+    if current:
         rows.append(current)
 
     if not rows:
-        raise ValueError(
-            "No transactions were found."
-        )
+        raise ValueError("No transactions found.")
 
     data = pd.DataFrame(rows)
-
     data["Date"] = pd.to_datetime(
         data["Date"],
         format="%d/%m/%y",
         errors="coerce",
     )
+    data["Withdrawal"] = data["Withdrawal"].map(parse_amount)
+    data["Deposit"] = data["Deposit"].map(parse_amount)
+    data["Balance"] = data["Balance"].map(parse_amount)
 
-    data["Withdrawal"] = data["Withdrawal"].map(
-        parse_amount
-    )
-    data["Deposit"] = data["Deposit"].map(
-        parse_amount
-    )
-    data["Balance"] = data["Balance"].map(
-        parse_amount
-    )
-
-    data = data.dropna(subset=["Date"]).copy()
-
+    data = data.dropna(subset=["Date"])
     data = data[
         (data["Withdrawal"] > 0)
         | (data["Deposit"] > 0)
     ].copy()
 
-    data["Type"] = data.apply(
-        lambda row: (
-            "Expense"
-            if row["Withdrawal"] > 0
-            else "Income"
-        ),
-        axis=1,
+    data["Month"] = data["Date"].dt.to_period("M").astype(str)
+    return classify_transactions(data)
+
+
+def build_email_summary(data):
+    spending = data[data["Withdrawal"] > 0]
+    total_spending = spending["Withdrawal"].sum()
+    total_income = data["Deposit"].sum()
+
+    categories = (
+        spending.groupby("Category")["Withdrawal"]
+        .sum()
+        .sort_values(ascending=False)
     )
 
-    data["Month"] = data["Date"].dt.to_period("M").astype(str)
-    data = classify_transactions(data)
+    merchants = (
+        spending.groupby("Merchant")["Withdrawal"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(10)
+    )
 
-    return data.sort_values("Date").reset_index(drop=True)
+    category_text = "\n".join(
+        f"- {name}: ₹{value:,.2f}"
+        for name, value in categories.items()
+    )
+    merchant_text = "\n".join(
+        f"- {name}: ₹{value:,.2f}"
+        for name, value in merchants.items()
+    )
+
+    return f"""Personal Bank Spending Summary
+
+Period: {data['Date'].min():%d/%m/%Y} to {data['Date'].max():%d/%m/%Y}
+
+Total spending: ₹{total_spending:,.2f}
+Total income: ₹{total_income:,.2f}
+Net cash flow: ₹{total_income - total_spending:,.2f}
+Transactions: {len(data):,}
+
+Spending by category:
+{category_text or '- None'}
+
+Top merchants:
+{merchant_text or '- None'}
+
+This is an aggregated summary only.
+"""
 
 
-def format_inr(value):
+def send_email(recipient, summary):
+    config = st.secrets["gmail"]
+    sender = config["sender_email"]
+    password = config["app_password"].replace(" ", "")
+
+    message = MIMEText(summary, "plain", "utf-8")
+    message["Subject"] = "Personal Bank Spending Summary"
+    message["From"] = sender
+    message["To"] = recipient
+
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+        server.starttls()
+        server.login(sender, password)
+        server.send_message(message)
+
+
+def inr(value):
     return f"₹{value:,.2f}"
 
 
 st.title("Personal Bank Spend Analyzer")
-
-st.caption(
-    "Upload a fixed-width TXT bank statement. "
-    "The file is processed for this session."
-)
+st.caption("Upload a fixed-width TXT statement for analysis.")
 
 uploaded_file = st.file_uploader(
     "Upload your bank statement",
     type=["txt"],
 )
 
-if uploaded_file is None:
-    st.info(
-        "Upload a TXT statement exported from your bank."
-    )
+if not uploaded_file:
+    st.info("Upload a TXT statement to begin.")
     st.stop()
 
 try:
-    transactions = parse_txt(
-        uploaded_file.getvalue()
-    )
+    transactions = parse_txt(uploaded_file.getvalue())
 except Exception as error:
     st.error(f"Could not read the statement: {error}")
     st.stop()
 
-if transactions.empty:
-    st.warning("No transactions were detected.")
-    st.stop()
-
 with st.sidebar:
-    st.header("Filters")
-
-    available_categories = sorted(
-        transactions["Category"].unique()
-    )
-
+    categories = sorted(transactions["Category"].unique())
     selected_categories = st.multiselect(
         "Categories",
-        available_categories,
-        default=available_categories,
+        categories,
+        default=categories,
     )
 
-    minimum_date = transactions["Date"].min().date()
-    maximum_date = transactions["Date"].max().date()
-
-    selected_dates = st.date_input(
+    start_date = transactions["Date"].min().date()
+    end_date = transactions["Date"].max().date()
+    date_range = st.date_input(
         "Date range",
-        value=(minimum_date, maximum_date),
-        min_value=minimum_date,
-        max_value=maximum_date,
+        value=(start_date, end_date),
+        min_value=start_date,
+        max_value=end_date,
     )
 
-if isinstance(selected_dates, (tuple, list)):
-    if len(selected_dates) == 2:
-        start_date, end_date = selected_dates
-    else:
-        start_date = end_date = selected_dates[0]
-else:
-    start_date = end_date = selected_dates
+if len(date_range) == 2:
+    start_date, end_date = date_range
 
 filtered = transactions[
     transactions["Category"].isin(selected_categories)
-    & transactions["Date"].dt.date.between(
-        start_date,
-        end_date,
-    )
+    & transactions["Date"].dt.date.between(start_date, end_date)
 ].copy()
 
-if filtered.empty:
-    st.warning(
-        "No transactions match the selected filters."
-    )
-    st.stop()
+spending = filtered["Withdrawal"].sum()
+income = filtered["Deposit"].sum()
 
-total_spending = filtered["Withdrawal"].sum()
-total_income = filtered["Deposit"].sum()
-net_cash_flow = total_income - total_spending
+one, two, three = st.columns(3)
+one.metric("Total spending", inr(spending))
+two.metric("Total income", inr(income))
+three.metric("Net cash flow", inr(income - spending))
 
-one, two, three, four = st.columns(4)
-
-one.metric(
-    "Total spending",
-    format_inr(total_spending),
-)
-two.metric(
-    "Total income",
-    format_inr(total_income),
-)
-three.metric(
-    "Net cash flow",
-    format_inr(net_cash_flow),
-)
-four.metric(
-    "Transactions",
-    f"{len(filtered):,}",
+overview, details, review = st.tabs(
+    ["Overview", "Transactions", "Review"]
 )
 
-overview_tab, transactions_tab, review_tab = st.tabs(
-    [
-        "Overview",
-        "Transactions",
-        "Review",
-    ]
-)
-
-with overview_tab:
-    st.subheader("Spending by category")
-
+with overview:
     category_totals = (
         filtered[filtered["Withdrawal"] > 0]
         .groupby("Category")["Withdrawal"]
         .sum()
         .sort_values(ascending=False)
     )
-
+    st.subheader("Spending by category")
     st.bar_chart(category_totals)
 
-    st.subheader("Monthly spending")
-
-    monthly_totals = (
-        filtered[filtered["Withdrawal"] > 0]
-        .groupby("Month")["Withdrawal"]
-        .sum()
-    )
-
-    st.line_chart(monthly_totals)
-
     st.subheader("Spending by merchant")
-
     merchant_totals = (
         filtered[filtered["Withdrawal"] > 0]
-        .groupby(
-            ["Category", "Merchant"],
-            as_index=False,
-        )["Withdrawal"]
+        .groupby(["Category", "Merchant"])["Withdrawal"]
         .sum()
-        .sort_values(
-            "Withdrawal",
-            ascending=False,
-        )
+        .reset_index()
+        .sort_values("Withdrawal", ascending=False)
     )
-
     st.dataframe(
         merchant_totals,
         use_container_width=True,
         hide_index=True,
     )
 
-    st.subheader("Largest expenses")
-
-    largest_expenses = (
-        filtered[filtered["Withdrawal"] > 0]
-        .sort_values(
-            "Withdrawal",
-            ascending=False,
-        )
-        .head(10)
-    )
-
+with details:
+    display = filtered.copy()
+    display["Date"] = display["Date"].dt.strftime("%d/%m/%Y")
     st.dataframe(
-        largest_expenses[
-            [
-                "Date",
-                "Merchant",
-                "Category",
-                "Withdrawal",
-                "Narration",
-            ]
-        ],
+        display,
         use_container_width=True,
         hide_index=True,
     )
 
-with transactions_tab:
-    display_data = filtered.copy()
-    display_data["Date"] = display_data[
-        "Date"
-    ].dt.strftime("%d/%m/%Y")
-
-    st.dataframe(
-        display_data,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    csv_data = display_data.to_csv(
-        index=False
-    ).encode("utf-8")
-
-    st.download_button(
-        "Download analyzed statement",
-        data=csv_data,
-        file_name="spend_analysis.csv",
-        mime="text/csv",
-    )
-
-with review_tab:
-    st.subheader("Transactions requiring review")
-
-    review_data = filtered[
+with review:
+    low_confidence = filtered[
         filtered["Confidence"] == "Low"
-    ].copy()
-
-    if review_data.empty:
-        st.success(
-            "No low-confidence transactions found."
-        )
-    else:
-        st.dataframe(
-            review_data[
-                [
-                    "Date",
-                    "Narration",
-                    "Merchant",
-                    "Category",
-                    "Confidence",
-                    "Classification Reason",
-                    "Withdrawal",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.subheader("Other spending totals")
-
-    other_totals = (
-        filtered[
-            (filtered["Category"] == "Other")
-            & (filtered["Withdrawal"] > 0)
-        ]
-        .groupby("Merchant", as_index=False)["Withdrawal"]
-        .sum()
-        .sort_values(
-            "Withdrawal",
-            ascending=False,
-        )
+    ]
+    st.dataframe(
+        low_confidence,
+        use_container_width=True,
+        hide_index=True,
     )
 
-    if other_totals.empty:
-        st.info("There is no spending classified as Other.")
-    else:
-        st.dataframe(
-            other_totals,
-            use_container_width=True,
-            hide_index=True,
-        )
+st.divider()
+st.subheader("Email summary")
 
-st.caption(
-    "Merchant recognition and category inference use "
-    "transparent rules. Unknown merchants remain Other."
+recipient = st.text_input(
+    "Send summary to",
+    value=st.secrets.get("gmail", {}).get("sender_email", ""),
 )
+
+if st.button("Send summary email"):
+    try:
+        send_email(
+            recipient.strip(),
+            build_email_summary(filtered),
+        )
+        st.success("Summary email sent.")
+    except Exception as error:
+        st.error(f"Email failed: {error}")
