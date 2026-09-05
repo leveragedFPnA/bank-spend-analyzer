@@ -184,7 +184,7 @@ def extract_unknown_merchant(narration):
         for word in text.split()
         if len(word) > 1
         and not any(character.isdigit() for character in word)
-        and word not in {"com", "in"},
+        and word not in {"com", "in"}
     ]
 
     return " ".join(words[:4]).title() or "Unknown"
