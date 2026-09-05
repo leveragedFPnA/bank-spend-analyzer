@@ -3,7 +3,6 @@ import hmac
 import io
 import re
 import smtplib
-from datetime import date
 from email.mime.text import MIMEText
 
 import pandas as pd
@@ -46,28 +45,31 @@ CATEGORIES = [
 ]
 
 
-def secret_section(name):
+def get_secret_section(name):
     try:
         return st.secrets.get(name, {})
     except Exception:
         return {}
 
 
-def require_app_password():
-    settings = secret_section("app")
-    expected = settings.get("access_password")
+def require_password():
+    settings = get_secret_section("app")
+    expected_password = settings.get("access_password")
 
-    if not expected:
-        return True
+    if not expected_password:
+        return
 
     if st.session_state.get("authenticated"):
-        return True
+        return
 
     st.title("Bank Spend Analyzer")
-    entered = st.text_input("Enter your private app password", type="password")
+    entered_password = st.text_input(
+        "Enter your private app password",
+        type="password",
+    )
 
     if st.button("Unlock", type="primary"):
-        if hmac.compare_digest(entered, expected):
+        if hmac.compare_digest(entered_password, expected_password):
             st.session_state.authenticated = True
             st.rerun()
         else:
@@ -76,61 +78,73 @@ def require_app_password():
     st.stop()
 
 
-def get_supabase():
+def get_database():
     if create_client is None:
         return None, "Install the supabase package."
 
-    settings = secret_section("supabase")
+    settings = get_secret_section("supabase")
     url = settings.get("url")
     key = settings.get("key")
 
     if not url or not key:
-        return None, "Supabase settings are missing from Streamlit Secrets."
+        return None, "Add Supabase URL and key to Streamlit Secrets."
 
     try:
         return create_client(url, key), None
-    except Exception as exc:
-        return None, str(exc)
+    except Exception as error:
+        return None, str(error)
 
 
-def normalize_text(value):
-    value = "" if pd.isna(value) else str(value)
-    return re.sub(r"\s+", " ", value.strip().lower())
+def normalize(value):
+    if pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip().lower())
 
 
-def find_column(df, keywords):
-    for column in df.columns:
-        name = normalize_text(column).replace("_", " ")
-        if any(keyword in name for keyword in keywords):
+def find_column(dataframe, keywords):
+    for column in dataframe.columns:
+        column_name = normalize(column).replace("_", " ")
+        if any(keyword in column_name for keyword in keywords):
             return column
     return None
 
 
 def parse_amount(value):
-    if pd.isna(value) or str(value).strip() == "":
+    if pd.isna(value):
         return None
 
-    text = str(value).strip().replace("$", "").replace(",", "")
-    negative = text.startswith("(") and text.endswith(")")
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    negative_parentheses = text.startswith("(") and text.endswith(")")
+    text = text.replace("$", "").replace(",", "")
     text = text.replace("(", "").replace(")", "")
     text = re.sub(r"[^0-9.\-]", "", text)
 
     number = pd.to_numeric(text, errors="coerce")
+
     if pd.isna(number):
         return None
 
-    return -abs(float(number)) if negative else float(number)
+    number = float(number)
+
+    if negative_parentheses:
+        number = -abs(number)
+
+    return number
 
 
-def merchant_name(description):
-    words = re.findall(r"[a-z0-9]+", normalize_text(description))
+def get_merchant(description):
+    words = re.findall(r"[a-z0-9]+", normalize(description))
     words = [word for word in words if len(word) > 2]
     return " ".join(words[:5]) or "Unknown merchant"
 
 
 def classify_transaction(description, transaction_type):
-    text = normalize_text(description)
-    tx_type = normalize_text(transaction_type)
+    text = normalize(description)
+    transaction_type = normalize(transaction_type)
 
     investment_terms = [
         "fidelity",
@@ -153,22 +167,22 @@ def classify_transaction(description, transaction_type):
     if any(term in text for term in ["payroll", "salary", "direct deposit"]):
         return "Income"
 
-    if tx_type == "credit" and any(
+    if transaction_type == "credit" and any(
         term in text for term in ["deposit", "refund", "interest", "dividend"]
     ):
         return "Income"
 
     category_terms = {
         "Housing": ["rent", "mortgage", "hoa", "property management"],
-        "Utilities": ["electric", "water", "gas bill", "internet", "verizon", "t-mobile"],
-        "Groceries": ["grocery", "market", "aldi", "kroger", "whole foods", "walmart"],
-        "Food & Dining": ["restaurant", "cafe", "coffee", "doordash", "ubereats", "grubhub"],
+        "Utilities": ["electric", "water", "internet", "verizon", "t-mobile"],
+        "Groceries": ["grocery", "market", "aldi", "kroger", "whole foods"],
+        "Food & Dining": ["restaurant", "cafe", "coffee", "doordash", "ubereats"],
         "Transportation": ["uber", "lyft", "transit", "parking", "toll"],
         "Fuel": ["shell", "chevron", "exxon", "bp", "fuel", "gas station"],
-        "Shopping": ["amazon", "target", "costco", "mall", "store"],
+        "Shopping": ["amazon", "target", "costco", "walmart", "store"],
         "Entertainment": ["netflix", "spotify", "movie", "theater", "hulu"],
         "Healthcare": ["medical", "pharmacy", "doctor", "dental", "health"],
-        "Debt Payments": ["loan", "credit card payment", "capital one payment"],
+        "Debt Payments": ["loan", "credit card payment"],
         "Transfers": ["transfer", "zelle", "venmo", "cash app"],
         "Bank Fees": ["fee", "service charge", "overdraft"],
         "Taxes": ["irs", "tax", "state tax"],
@@ -181,82 +195,126 @@ def classify_transaction(description, transaction_type):
     return "Other"
 
 
-def standardize_dataframe(raw_df, source_file):
-    df = raw_df.copy()
-    df = df.dropna(how="all")
+def read_delimited_file(uploaded_file):
+    raw_bytes = uploaded_file.getvalue()
 
-    if df.empty:
+    for delimiter in [",", "\t", ";", "|"]:
+        try:
+            dataframe = pd.read_csv(
+                io.BytesIO(raw_bytes),
+                sep=delimiter,
+                dtype=str,
+            )
+
+            if len(dataframe.columns) > 1:
+                return dataframe
+
+        except Exception:
+            continue
+
+    raise ValueError(
+        "Could not determine the file delimiter. "
+        "Please upload a normal CSV or Excel file."
+    )
+
+
+def standardize_dataframe(raw_data, source_file):
+    data = raw_data.copy().dropna(how="all")
+
+    if data.empty:
         raise ValueError("The uploaded file contains no usable rows.")
 
-    df.columns = [str(column).strip() for column in df.columns]
+    data.columns = [str(column).strip() for column in data.columns]
 
     date_column = find_column(
-        df,
+        data,
         ["date", "posted", "transaction date", "trans date"],
     )
+
     description_column = find_column(
-        df,
+        data,
         ["description", "memo", "details", "merchant", "payee", "name"],
     )
+
     amount_column = find_column(
-        df,
-        ["amount", "transaction amount", "debit amount", "credit amount"],
+        data,
+        ["amount", "transaction amount"],
     )
-    debit_column = find_column(df, ["debit", "withdrawal", "charge"])
-    credit_column = find_column(df, ["credit", "deposit"])
+
+    debit_column = find_column(
+        data,
+        ["debit", "withdrawal", "charge"],
+    )
+
+    credit_column = find_column(
+        data,
+        ["credit", "deposit"],
+    )
 
     if date_column is None:
-        raise ValueError("Could not find a transaction date column.")
+        raise ValueError("Could not find a date column.")
 
     result = pd.DataFrame()
+
     result["transaction_date"] = pd.to_datetime(
-        df[date_column],
+        data[date_column],
         errors="coerce",
     ).dt.date
 
     if description_column:
-        result["description"] = df[description_column].fillna("").astype(str)
-    else:
-        text_columns = df.select_dtypes(include=["object"]).columns
         result["description"] = (
-            df[text_columns].fillna("").astype(str).agg(" ".join, axis=1)
+            data[description_column].fillna("").astype(str)
+        )
+    else:
+        text_columns = data.select_dtypes(include=["object"]).columns
+        result["description"] = (
+            data[text_columns]
+            .fillna("")
+            .astype(str)
+            .agg(" ".join, axis=1)
         )
 
     if debit_column or credit_column:
-        debit_values = (
-            df[debit_column].apply(parse_amount)
-            if debit_column
-            else pd.Series(0.0, index=df.index)
-        )
-        credit_values = (
-            df[credit_column].apply(parse_amount)
-            if credit_column
-            else pd.Series(0.0, index=df.index)
+        if debit_column:
+            debit = data[debit_column].apply(parse_amount).fillna(0)
+        else:
+            debit = pd.Series(0.0, index=data.index)
+
+        if credit_column:
+            credit = data[credit_column].apply(parse_amount).fillna(0)
+        else:
+            credit = pd.Series(0.0, index=data.index)
+
+        result["amount"] = debit.abs().where(
+            debit.abs() > 0,
+            credit.abs(),
         )
 
-        debit_values = pd.to_numeric(debit_values, errors="coerce").fillna(0)
-        credit_values = pd.to_numeric(credit_values, errors="coerce").fillna(0)
-
-        result["amount"] = debit_values.abs().where(
-            debit_values.abs() > 0,
-            credit_values.abs(),
+        result["transaction_type"] = debit.abs().where(
+            debit.abs() > 0,
+            credit.abs(),
+        ).apply(
+            lambda value: "Debit" if value > 0 else "Credit"
         )
-        result["transaction_type"] = debit_values.abs().where(
-            debit_values.abs() > 0,
-            credit_values.abs(),
-        ).apply(lambda value: "Debit" if value > 0 else "Credit")
+
     elif amount_column:
-        raw_amounts = df[amount_column].apply(parse_amount)
+        raw_amounts = data[amount_column].apply(parse_amount)
         result["amount"] = raw_amounts.abs()
         result["transaction_type"] = raw_amounts.apply(
-            lambda value: "Debit"
-            if pd.notna(value) and value < 0
-            else "Credit"
+            lambda value: (
+                "Debit"
+                if pd.notna(value) and value < 0
+                else "Credit"
+            )
         )
-    else:
-        raise ValueError("Could not find an amount, debit, or credit column.")
 
-    result["merchant"] = result["description"].apply(merchant_name)
+    else:
+        raise ValueError(
+            "Could not find an amount, debit, or credit column."
+        )
+
+    result["merchant"] = result["description"].apply(get_merchant)
+
     result["category"] = result.apply(
         lambda row: classify_transaction(
             row["description"],
@@ -264,11 +322,19 @@ def standardize_dataframe(raw_df, source_file):
         ),
         axis=1,
     )
+
     result["source_file"] = source_file
     result["user_id"] = "personal"
 
-    result = result.dropna(subset=["transaction_date", "amount"])
-    result["amount"] = pd.to_numeric(result["amount"], errors="coerce")
+    result = result.dropna(
+        subset=["transaction_date", "amount"]
+    )
+
+    result["amount"] = pd.to_numeric(
+        result["amount"],
+        errors="coerce",
+    )
+
     result = result.dropna(subset=["amount"])
 
     result["transaction_key"] = result.apply(
@@ -276,9 +342,9 @@ def standardize_dataframe(raw_df, source_file):
             "|".join(
                 [
                     str(row["transaction_date"]),
-                    normalize_text(row["description"]),
+                    normalize(row["description"]),
                     f"{float(row['amount']):.2f}",
-                    normalize_text(row["transaction_type"]),
+                    normalize(row["transaction_type"]),
                 ]
             ).encode("utf-8")
         ).hexdigest(),
@@ -302,10 +368,11 @@ def standardize_dataframe(raw_df, source_file):
 
 def parse_pdf(uploaded_file):
     if PdfReader is None:
-        raise ValueError("Install pypdf to read PDF statements.")
+        raise ValueError("Install pypdf to read PDF files.")
 
     reader = PdfReader(uploaded_file)
     rows = []
+
     date_pattern = r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
     amount_pattern = r"-?\(?\$?\d[\d,]*\.\d{2}\)?"
 
@@ -321,25 +388,24 @@ def parse_pdf(uploaded_file):
 
             date_text = date_match.group(0)
             amount_text = amounts[-1]
-            amount_value = parse_amount(amount_text)
-
-            if amount_value is None:
-                continue
-
             description = line.replace(date_text, "", 1)
-            description = description.replace(amount_text, "", 1).strip(" -|")
+            description = description.replace(
+                amount_text,
+                "",
+                1,
+            ).strip(" -|")
 
             rows.append(
                 {
                     "Date": date_text,
                     "Description": description,
-                    "Amount": amount_value,
+                    "Amount": parse_amount(amount_text),
                 }
             )
 
     if not rows:
         raise ValueError(
-            "No transactions found in the PDF. A text-based PDF is required."
+            "No transactions were found in the PDF."
         )
 
     return pd.DataFrame(rows)
@@ -348,40 +414,35 @@ def parse_pdf(uploaded_file):
 def parse_upload(uploaded_file):
     filename = uploaded_file.name.lower()
 
-    if filename.endswith(".csv"):
-        uploaded_file.seek(0)
-        try:
-            raw_df = pd.read_csv(uploaded_file)
-        except Exception:
-            uploaded_file.seek(0)
-            raw_df = pd.read_csv(uploaded_file, sep=None, engine="python")
-        return standardize_dataframe(raw_df, uploaded_file.name)
+    if filename.endswith((".csv", ".txt")):
+        raw_data = read_delimited_file(uploaded_file)
+        return standardize_dataframe(
+            raw_data,
+            uploaded_file.name,
+        )
 
-    if filename.endswith(".xlsx") or filename.endswith(".xls"):
-        uploaded_file.seek(0)
-        raw_df = pd.read_excel(uploaded_file)
-        return standardize_dataframe(raw_df, uploaded_file.name)
+    if filename.endswith((".xlsx", ".xls")):
+        raw_data = pd.read_excel(uploaded_file)
+        return standardize_dataframe(
+            raw_data,
+            uploaded_file.name,
+        )
 
     if filename.endswith(".pdf"):
-        uploaded_file.seek(0)
-        raw_df = parse_pdf(uploaded_file)
-        return standardize_dataframe(raw_df, uploaded_file.name)
+        raw_data = parse_pdf(uploaded_file)
+        return standardize_dataframe(
+            raw_data,
+            uploaded_file.name,
+        )
 
-    if filename.endswith(".txt"):
-        uploaded_file.seek(0)
-        content = uploaded_file.read().decode("utf-8", errors="ignore")
-        raw_df = pd.read_csv(io.StringIO(content), sep=None, engine="python")
-        return standardize_dataframe(raw_df, uploaded_file.name)
-
-    raise ValueError("Supported files are CSV, XLSX, XLS, PDF, and TXT.")
+    raise ValueError(
+        "Supported files are CSV, TXT, XLSX, XLS, and PDF."
+    )
 
 
-def load_transactions(db):
-    if db is None:
-        return pd.DataFrame()
-
+def load_transactions(database):
     response = (
-        db.table("transactions")
+        database.table("transactions")
         .select("*")
         .eq("user_id", "personal")
         .order("transaction_date", desc=True)
@@ -389,59 +450,64 @@ def load_transactions(db):
     )
 
     rows = response.data or []
+
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
-    df["transaction_date"] = pd.to_datetime(
-        df["transaction_date"],
+    data = pd.DataFrame(rows)
+
+    data["transaction_date"] = pd.to_datetime(
+        data["transaction_date"],
         errors="coerce",
     ).dt.date
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-    df["category"] = df["category"].fillna("Other")
-    df["merchant"] = df["merchant"].fillna("")
-    return df
+
+    data["amount"] = pd.to_numeric(
+        data["amount"],
+        errors="coerce",
+    )
+
+    data["category"] = data["category"].fillna("Other")
+    data["merchant"] = data["merchant"].fillna("")
+
+    return data
 
 
-def load_rules(db):
-    if db is None:
-        return {}
-
+def load_rules(database):
     response = (
-        db.table("category_rules")
-        .select("merchant,final_category,pattern,category")
+        database.table("category_rules")
+        .select("*")
         .eq("user_id", "personal")
         .execute()
     )
 
     rules = {}
+
     for row in response.data or []:
         merchant = row.get("merchant") or row.get("pattern")
         category = row.get("final_category") or row.get("category")
 
         if merchant and category:
-            rules[normalize_text(merchant)] = category
+            rules[normalize(merchant)] = category
 
     return rules
 
 
-def apply_saved_rules(df, rules):
-    result = df.copy()
+def apply_rules(data, rules):
+    result = data.copy()
 
     for index, row in result.iterrows():
-        merchant = normalize_text(row.get("merchant", ""))
+        merchant = normalize(row.get("merchant", ""))
+
         if merchant in rules:
             result.at[index, "category"] = rules[merchant]
 
     return result
 
 
-def save_transactions(db, df):
-    if db is None or df.empty:
-        return
-
+def save_transactions(database, data):
     records = []
-    for row in df.to_dict("records"):
+
+    for row in data.to_dict("records"):
         records.append(
             {
                 "transaction_key": str(row["transaction_key"]),
@@ -450,49 +516,53 @@ def save_transactions(db, df):
                 "description": str(row["description"]),
                 "merchant": str(row["merchant"]),
                 "amount": float(row["amount"]),
-                "transaction_type": str(row["transaction_type"]),
+                "transaction_type": str(
+                    row["transaction_type"]
+                ),
                 "category": str(row["category"]),
                 "source_file": str(row["source_file"]),
             }
         )
 
     for start in range(0, len(records), 500):
-        db.table("transactions").upsert(
+        database.table("transactions").upsert(
             records[start : start + 500],
             on_conflict="transaction_key",
         ).execute()
 
 
-def save_category_changes(db, original_df, edited_df):
-    changed = 0
-    rules = {}
-
-    original_categories = original_df.set_index(
+def save_category_changes(database, original, edited):
+    original_categories = original.set_index(
         "transaction_key"
     )["category"].to_dict()
 
-    for _, row in edited_df.iterrows():
-        key = str(row.get("transaction_key", "")).strip()
-        new_category = str(row.get("category", "Other")).strip() or "Other"
+    changed = 0
+    rules = {}
 
-        if not key or key not in original_categories:
+    for _, row in edited.iterrows():
+        key = str(row["transaction_key"])
+        new_category = str(
+            row.get("category", "Other")
+        ).strip() or "Other"
+
+        old_category = str(
+            original_categories.get(key, "Other")
+        )
+
+        if new_category == old_category:
             continue
 
-        old_category = str(original_categories[key])
-        if old_category == new_category:
-            continue
-
-        if db is not None:
-            (
-                db.table("transactions")
-                .update({"category": new_category})
-                .eq("transaction_key", key)
-                .execute()
-            )
+        (
+            database.table("transactions")
+            .update({"category": new_category})
+            .eq("transaction_key", key)
+            .execute()
+        )
 
         merchant = str(row.get("merchant", "")).strip()
-        if merchant and merchant.lower() not in {"nan", "none"}:
-            rules[normalize_text(merchant)] = {
+
+        if merchant:
+            rules[normalize(merchant)] = {
                 "user_id": "personal",
                 "merchant": merchant,
                 "final_category": new_category,
@@ -502,31 +572,30 @@ def save_category_changes(db, original_df, edited_df):
 
         changed += 1
 
-    if db is not None:
-        for rule in rules.values():
-            (
-                db.table("category_rules")
-                .upsert(
-                    rule,
-                    on_conflict="user_id,merchant",
-                )
-                .execute()
+    for rule in rules.values():
+        (
+            database.table("category_rules")
+            .upsert(
+                rule,
+                on_conflict="user_id,merchant",
             )
+            .execute()
+        )
 
     return changed
 
 
-def send_email_summary(summary_text, recipient):
-    settings = secret_section("gmail")
+def send_email(summary, recipient):
+    settings = get_secret_section("gmail")
     sender = settings.get("address")
     app_password = settings.get("app_password")
 
     if not sender or not app_password:
         raise ValueError(
-            "Add gmail.address and gmail.app_password to Streamlit Secrets."
+            "Add Gmail address and app password to Secrets."
         )
 
-    message = MIMEText(summary_text)
+    message = MIMEText(summary)
     message["Subject"] = "Bank Spend Analyzer Summary"
     message["From"] = sender
     message["To"] = recipient
@@ -537,50 +606,65 @@ def send_email_summary(summary_text, recipient):
         server.send_message(message)
 
 
-def show_forecast(df):
-    expenses = df[
-        df["transaction_type"].str.lower().eq("debit")
+def show_forecast(data):
+    expenses = data[
+        data["transaction_type"].str.lower() == "debit"
     ].copy()
 
     if expenses.empty:
-        st.info("No debit transactions are available for forecasting.")
+        st.info("No debit transactions available.")
         return
 
     expenses["month"] = pd.to_datetime(
         expenses["transaction_date"]
     ).dt.to_period("M").astype(str)
 
-    monthly = expenses.groupby("month")["amount"].sum().sort_index()
-    average_monthly = monthly.tail(3).mean()
+    monthly = expenses.groupby("month")["amount"].sum()
+    average = monthly.tail(3).mean()
 
     st.subheader("Spending forecast")
-    col1, col2 = st.columns(2)
-    col1.metric("Average monthly spending", f"${average_monthly:,.2f}")
-    col2.metric("Next-month estimate", f"${average_monthly:,.2f}")
 
-    if not monthly.empty:
-        st.line_chart(monthly)
+    first, second = st.columns(2)
+    first.metric(
+        "Average monthly spending",
+        f"${average:,.2f}",
+    )
+    second.metric(
+        "Next-month estimate",
+        f"${average:,.2f}",
+    )
+
+    st.line_chart(monthly)
 
 
-require_app_password()
+require_password()
 
 st.title("Bank Spend Analyzer")
-st.caption("Upload statements, review every transaction, and save categories.")
+st.caption(
+    "Upload statements, review every transaction, "
+    "and save categories."
+)
 
-db, db_error = get_supabase()
+database, database_error = get_database()
 
-if db_error:
-    st.sidebar.warning(db_error)
+if database_error:
+    st.sidebar.warning(database_error)
 
 if "data" not in st.session_state:
-    try:
-        st.session_state.data = load_transactions(db)
-    except Exception as exc:
+    if database is not None:
+        try:
+            st.session_state.data = load_transactions(database)
+        except Exception as error:
+            st.session_state.data = pd.DataFrame()
+            st.sidebar.error(
+                f"Saved transactions could not be loaded: {error}"
+            )
+    else:
         st.session_state.data = pd.DataFrame()
-        st.sidebar.error(f"Saved transactions could not be loaded: {exc}")
 
 with st.sidebar:
     st.header("Import statement")
+
     uploaded_file = st.file_uploader(
         "Upload CSV, Excel, PDF, or TXT",
         type=["csv", "xlsx", "xls", "pdf", "txt"],
@@ -588,16 +672,18 @@ with st.sidebar:
 
     if st.button("Import statement", type="primary"):
         if uploaded_file is None:
-            st.warning("Choose a statement file first.")
+            st.warning("Choose a file first.")
         else:
             try:
                 imported = parse_upload(uploaded_file)
-                rules = load_rules(db)
-                imported = apply_saved_rules(imported, rules)
 
-                if db is not None:
-                    save_transactions(db, imported)
-                    st.session_state.data = load_transactions(db)
+                if database is not None:
+                    rules = load_rules(database)
+                    imported = apply_rules(imported, rules)
+                    save_transactions(database, imported)
+                    st.session_state.data = load_transactions(
+                        database
+                    )
                 else:
                     existing = st.session_state.data
                     st.session_state.data = pd.concat(
@@ -608,14 +694,17 @@ with st.sidebar:
                         keep="last",
                     )
 
-                st.success(f"Imported {len(imported)} transaction(s).")
+                st.success(
+                    f"Imported {len(imported)} transaction(s)."
+                )
                 st.rerun()
-            except Exception as exc:
-                st.error(f"Import failed: {exc}")
+
+            except Exception as error:
+                st.error(f"Import failed: {error}")
 
 data = st.session_state.data
 
-if data is None or data.empty:
+if data.empty:
     st.info("Upload a statement to begin.")
     st.stop()
 
@@ -623,6 +712,7 @@ data["transaction_date"] = pd.to_datetime(
     data["transaction_date"],
     errors="coerce",
 ).dt.date
+
 data["category"] = data["category"].fillna("Other")
 data["merchant"] = data["merchant"].fillna("")
 
@@ -649,30 +739,37 @@ else:
     start_date = end_date = selected_dates
 
 filtered = data[
-    data["transaction_date"].between(start_date, end_date)
+    data["transaction_date"].between(
+        start_date,
+        end_date,
+    )
     & data["category"].isin(selected_categories)
 ].copy()
 
 if filtered.empty:
-    st.warning("No transactions match the selected filters.")
+    st.warning("No transactions match the filters.")
     st.stop()
 
 debits = filtered[
-    filtered["transaction_type"].str.lower().eq("debit")
+    filtered["transaction_type"].str.lower() == "debit"
 ]["amount"].sum()
 
 credits = filtered[
-    filtered["transaction_type"].str.lower().eq("credit")
+    filtered["transaction_type"].str.lower() == "credit"
 ]["amount"].sum()
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Transactions", f"{len(filtered):,}")
-col2.metric("Spending", f"${debits:,.2f}")
-col3.metric("Income", f"${credits:,.2f}")
-col4.metric("Net", f"${credits - debits:,.2f}")
+first, second, third, fourth = st.columns(4)
+
+first.metric("Transactions", f"{len(filtered):,}")
+second.metric("Spending", f"${debits:,.2f}")
+third.metric("Income", f"${credits:,.2f}")
+fourth.metric("Net", f"${credits - debits:,.2f}")
 
 st.subheader("Review and categorize all transactions")
-st.caption("Edit the Category column for any transaction, then save your changes.")
+st.caption(
+    "Change any category, including Investments, "
+    "then save your changes."
+)
 
 review_columns = [
     "transaction_key",
@@ -684,21 +781,32 @@ review_columns = [
     "category",
 ]
 
-review_df = filtered[review_columns].copy()
+review_data = filtered[review_columns].copy()
 
-edited_df = st.data_editor(
-    review_df,
+edited_data = st.data_editor(
+    review_data,
     hide_index=True,
     use_container_width=True,
     num_rows="fixed",
     key="transaction_editor",
     column_config={
         "transaction_key": None,
-        "transaction_date": st.column_config.DateColumn("Date"),
-        "description": st.column_config.TextColumn("Description"),
-        "merchant": st.column_config.TextColumn("Merchant"),
-        "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
-        "transaction_type": st.column_config.TextColumn("Type"),
+        "transaction_date": st.column_config.DateColumn(
+            "Date"
+        ),
+        "description": st.column_config.TextColumn(
+            "Description"
+        ),
+        "merchant": st.column_config.TextColumn(
+            "Merchant"
+        ),
+        "amount": st.column_config.NumberColumn(
+            "Amount",
+            format="$%.2f",
+        ),
+        "transaction_type": st.column_config.TextColumn(
+            "Type"
+        ),
         "category": st.column_config.SelectboxColumn(
             "Category",
             options=CATEGORIES,
@@ -715,20 +823,26 @@ edited_df = st.data_editor(
 )
 
 if st.button("Save category changes", type="primary"):
-    try:
-        changed_count = save_category_changes(db, review_df, edited_df)
-
-        if db is None:
-            updated = data.set_index("transaction_key")
-            for _, row in edited_df.iterrows():
-                key = row["transaction_key"]
-                updated.loc[key, "category"] = row["category"]
-            st.session_state.data = updated.reset_index()
-
-        st.success(f"Saved {changed_count} category change(s).")
-        st.rerun()
-    except Exception as exc:
-        st.error(f"Categories could not be saved: {exc}")
+    if database is None:
+        st.error(
+            "Supabase is required to save category changes."
+        )
+    else:
+        try:
+            changed = save_category_changes(
+                database,
+                review_data,
+                edited_data,
+            )
+            st.success(
+                f"Saved {changed} category change(s)."
+            )
+            st.session_state.data = load_transactions(database)
+            st.rerun()
+        except Exception as error:
+            st.error(
+                f"Categories could not be saved: {error}"
+            )
 
 st.divider()
 show_forecast(filtered)
@@ -736,14 +850,16 @@ show_forecast(filtered)
 st.divider()
 st.subheader("Email summary")
 
-recipient = st.text_input("Recipient email address")
+recipient = st.text_input(
+    "Recipient email address"
+)
 
 if st.button("Send summary email"):
     if not recipient:
         st.warning("Enter a recipient email address.")
     else:
         summary = (
-            f"Transactions reviewed: {len(filtered)}\n"
+            f"Transactions: {len(filtered)}\n"
             f"Spending: ${debits:,.2f}\n"
             f"Income: ${credits:,.2f}\n"
             f"Net: ${credits - debits:,.2f}\n"
@@ -751,7 +867,7 @@ if st.button("Send summary email"):
         )
 
         try:
-            send_email_summary(summary, recipient)
+            send_email(summary, recipient)
             st.success("Summary email sent.")
-        except Exception as exc:
-            st.error(f"Email could not be sent: {exc}")
+        except Exception as error:
+            st.error(f"Email could not be sent: {error}")
