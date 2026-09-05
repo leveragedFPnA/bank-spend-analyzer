@@ -66,6 +66,7 @@ ALL_CATEGORIES = [
     "Health",
     "Subscriptions",
     "Education",
+    "Investments",
     "Income",
     "Personal Transfer",
     "Cash Withdrawal",
@@ -951,10 +952,7 @@ with details:
 with review:
     st.subheader("Allocate Other expenses")
 
-    review_data = filtered[
-        (filtered["Category"] == "Other")
-        | (filtered["Confidence"] == "Low")
-    ].copy()
+    review_data = filtered.copy()
 
     if review_data.empty:
         st.success(
